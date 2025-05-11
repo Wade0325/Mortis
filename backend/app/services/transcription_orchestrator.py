@@ -58,46 +58,39 @@ def _load_vad_model(log_fn: OrchestratorLogCallbackType):
     VAD_UTILS = None
     return False
 
-# LRC Helper functions (移植自 vad_processor.py)
-def _parse_lrc_time_to_seconds(time_str: str) -> Optional[float]:
-    match = re.match(r'\[(\d{2}):(\d{2})\.(\d{2,3})\]', time_str)
-    if match:
-        m, s, cs_or_ms = map(int, match.groups())
-        millis = cs_or_ms * 10 if len(match.group(3)) == 2 else cs_or_ms
-        return m * 60 + s + millis / 1000.0
-    return None
-
-def _format_seconds_to_lrc(seconds: float) -> str:
+# Helper functions for SRT
+def _format_seconds_to_srt_timestamp(seconds: float) -> str:
     if seconds < 0: seconds = 0
-    minutes = int(seconds // 60)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 100))
-    if centis >= 100: # Handle rounding that pushes centis to 100
-        centis = 0
-        secs +=1
+    millis = int(round((seconds - int(seconds)) * 1000))
+    if millis >= 1000: # Handle rounding
+        millis = 0
+        secs += 1
         if secs >= 60:
             secs = 0
             minutes += 1
-    return f"[{minutes:02d}:{secs:02d}.{centis:02d}]"
+            if minutes >= 60:
+                minutes = 0
+                hours += 1
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def _adjust_lrc_timestamps(transcription_text: Optional[str], offset_seconds: float) -> str:
-    if not isinstance(transcription_text, str) or offset_seconds == 0:
-        return transcription_text or ""
-    adjusted_lines = []
-    for line in transcription_text.strip().split('\n'):
-        match = re.match(r'(\[\d{2}:\d{2}\.\d{2,3}\])(.*)', line)
-        if match:
-            original_ts_str, text_content = match.groups()
-            relative_time_sec = _parse_lrc_time_to_seconds(original_ts_str)
-            if relative_time_sec is not None:
-                absolute_time_sec = relative_time_sec + offset_seconds
-                new_ts_str = _format_seconds_to_lrc(absolute_time_sec)
-                adjusted_lines.append(new_ts_str + text_content)
-            else:
-                adjusted_lines.append(line) # Keep line if timestamp parsing fails
-        else:
-            adjusted_lines.append(line) # Keep line if no timestamp
-    return "\n".join(adjusted_lines)
+def _parse_srt_time_to_seconds(time_str: str) -> Optional[float]:
+    match = re.match(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', time_str)
+    if match:
+        h, m, s, ms = map(int, match.groups())
+        return h * 3600 + m * 60 + s + ms / 1000.0
+    return None
+
+def _adjust_srt_timestamps_and_reindex(srt_content: Optional[str], offset_seconds: float, start_index: int) -> tuple[str, int]:
+
+    if not isinstance(srt_content, str):
+        return srt_content or "", start_index
+
+    current_index = start_index
+       
+    return srt_content, current_index
 
 
 class TranscriptionOrchestrator:
@@ -153,33 +146,36 @@ class TranscriptionOrchestrator:
         vad_internal_min_silence_ms: int = 1000,
         speech_pad_ms: int = 50
     ) -> Optional[str]:
+        print(f"input_audio_path: {input_audio_path}")
         if VAD_MODEL is None or VAD_UTILS is None or self.transcriber is None:
             self._log_callback("error", {"message": "VAD 或轉錄器未初始化，無法處理。"})
             return None
         if not os.path.exists(input_audio_path):
             self._log_callback("error", {"message": f"找不到輸入音檔: {input_audio_path}"})
             return None
-
+        print(f"AAAAA")
         self._log_callback("progress", {"percentage": 5, "step_message": "載入音訊並進行 VAD..."})
 
         temp_chunk_files_to_clean = []
-        all_transcriptions_lrc: List[str] = []
-
+        all_transcriptions_srt_blocks: List[str] = []
+        current_srt_master_index = 1
+        print(f"BBBBB")
         try:
             # --- 1. 載入音訊和 VAD 偵測 ---
             read_audio_fn = VAD_UTILS["read_audio"]
             get_speech_timestamps_fn = VAD_UTILS["get_speech_timestamps"]
-
+            print(f"CCCCC")
             wav_tensor = read_audio_fn(input_audio_path, sampling_rate=TARGET_SAMPLE_RATE)
             duration_seconds = wav_tensor.shape[-1] / TARGET_SAMPLE_RATE
             self._log_callback("log", {"message": f"已載入音檔: {input_audio_path}, 時長: {duration_seconds:.2f}s"})
-
+            print(f"DDDDD")
             speech_timestamps: List[Dict[str, int]] = get_speech_timestamps_fn(
                 wav_tensor, VAD_MODEL, sampling_rate=TARGET_SAMPLE_RATE,
                 min_speech_duration_ms=250,
                 min_silence_duration_ms=vad_internal_min_silence_ms,
                 speech_pad_ms=speech_pad_ms
             )
+            print(f"EEEEE")
             # Convert sample-based timestamps to seconds
             speech_timestamps_sec: List[Dict[str, float]] = []
             if speech_timestamps and 'start' in speech_timestamps[0] and isinstance(speech_timestamps[0]['start'], int):
@@ -188,7 +184,7 @@ class TranscriptionOrchestrator:
                  speech_timestamps_sec = speech_timestamps
             else: # No speech detected by VAD
                  speech_timestamps_sec = []
-
+            print(f"FFFFF")
 
             self._log_callback("log", {"message": f"VAD 找到 {len(speech_timestamps_sec)} 個（可能重疊的）語音片段。"})
             if not speech_timestamps_sec:
@@ -196,7 +192,7 @@ class TranscriptionOrchestrator:
                 # Treat the whole file as one speech segment
                 speech_timestamps_sec = [{'start': 0.0, 'end': duration_seconds}]
 
-
+            print(f"GGGGG")
             # --- 2. 計算可靠的靜音間隔 (用於切割點) ---
             min_reliable_silence_sec = min_reliable_silence_ms / 1000.0
             reliable_silence_gaps: List[Dict[str, float]] = [] # {'start', 'end', 'mid'}
@@ -215,26 +211,26 @@ class TranscriptionOrchestrator:
                 if final_silence_duration >= min_reliable_silence_sec:
                     reliable_silence_gaps.append({'start': last_speech_end, 'end': duration_seconds, 'mid': (last_speech_end + duration_seconds) / 2})
             self._log_callback("log", {"message": f"找到 {len(reliable_silence_gaps)} 個可靠的靜音間隔 (>= {min_reliable_silence_sec:.2f}s)。"})
-
+            print(f"HHHHH")
 
             # --- 3. 迭代處理片段並轉錄 ---
             current_segment_start_time = 0.0
             target_segment_duration_seconds = segment_duration_minutes * 60.0
             chunk_index = 0
             total_chunks_estimate = max(1, math.ceil(duration_seconds / target_segment_duration_seconds)) # Rough estimate for progress
-
+            print(f"IIIII")
             while current_segment_start_time < duration_seconds:
                 chunk_index += 1
                 self._log_callback("progress", {
                     "percentage": int(10 + 80 * (current_segment_start_time / duration_seconds)), # 10% to 90% for this loop
                     "step_message": f"處理音訊片段 {chunk_index}/{total_chunks_estimate}..."
                 })
-
+                print(f"JJJJJ")
                 # --- 確定此片段的結束時間 (切割點) ---
                 # Target end time for this segment based on desired duration
                 ideal_segment_end_time = current_segment_start_time + target_segment_duration_seconds
                 actual_segment_end_time = duration_seconds # Default to end of file
-
+                print(f"KKKKK")
                 if ideal_segment_end_time < duration_seconds: # If not the last potential segment
                     # Find the first reliable silence gap *after* the ideal_segment_end_time
                     # and use its middle as the split point.
@@ -248,9 +244,15 @@ class TranscriptionOrchestrator:
                             break
                     if not found_split_point:
                         # If no suitable silence found after ideal time, extend to end of file for this chunk,
-                        # or if speech_timestamps_sec is empty (whole file as one segment)
+                        # or if the ideal end time is already very close to duration_seconds.
                         actual_segment_end_time = duration_seconds
-                        self._log_callback("log", {"message": f"片段 {chunk_index}: 未找到合適靜音切割點，將處理至檔案末尾 ({actual_segment_end_time:.2f}s) 或下個強制切割點。"})
+                        self._log_callback("log", {"message": f"片段 {chunk_index}: 未找到理想靜音切割點，延伸至檔案結尾 {actual_segment_end_time:.2f}s。"})
+                    # Ensure we don't create zero-length or tiny segments if actual_segment_end_time is too close or before current_start
+                    if actual_segment_end_time <= current_segment_start_time + 0.1: # Min 100ms segment
+                        actual_segment_end_time = current_segment_start_time + 0.1
+                        if actual_segment_end_time > duration_seconds: # Cap at file end
+                            actual_segment_end_time = duration_seconds
+                        self._log_callback("warn", {"message": f"片段 {chunk_index}: 切割點過近，調整片段結束時間至 {actual_segment_end_time:.2f}s"})
                 else: # This is the last segment
                      actual_segment_end_time = duration_seconds
                      self._log_callback("log", {"message": f"片段 {chunk_index}: 處理最後的音訊片段至檔案末尾 ({actual_segment_end_time:.2f}s)。"})
@@ -269,35 +271,49 @@ class TranscriptionOrchestrator:
                         break
                     continue
 
+                # MODIFIED: Handle 1D (mono) or 2D (stereo/multi-channel) tensors
+                if wav_tensor.ndim == 1:
+                    audio_chunk = wav_tensor[start_sample:end_sample]
+                elif wav_tensor.ndim == 2:
+                    audio_chunk = wav_tensor[:, start_sample:end_sample]
 
-                audio_chunk_tensor = wav_tensor[:, start_sample:end_sample]
+
                 self._log_callback("log", {"message": f"片段 {chunk_index}: 時間 [{current_segment_start_time:.2f}s - {actual_segment_end_time:.2f}s], 取樣點 [{start_sample} - {end_sample}]"})
 
                 # --- 儲存片段到暫存檔 ---
-                temp_chunk_path = self._save_chunk_to_temp_file(audio_chunk_tensor, TARGET_SAMPLE_RATE)
-                if not temp_chunk_path:
+                temp_chunk_file_path = self._save_chunk_to_temp_file(audio_chunk, TARGET_SAMPLE_RATE)
+                if not temp_chunk_file_path:
                     # Error already logged by _save_chunk_to_temp_file
                     # Decide if we should stop or try to continue
                     self._log_callback("error", {"message": f"片段 {chunk_index} 儲存失敗，跳過此片段的轉錄。"})
                     current_segment_start_time = actual_segment_end_time
                     continue # Move to next segment
-                temp_chunk_files_to_clean.append(temp_chunk_path)
+                temp_chunk_files_to_clean.append(temp_chunk_file_path)
 
 
                 # --- 上傳並轉錄片段 ---
-                self._log_callback("log", {"message": f"片段 {chunk_index}: 開始上傳和轉錄 {os.path.basename(temp_chunk_path)}..."})
-                uploaded_file_obj = self.transcriber.upload_file(temp_chunk_path)
+                self._log_callback("log", {"message": f"片段 {chunk_index}: 開始上傳和轉錄 {os.path.basename(temp_chunk_file_path)}..."})
+                uploaded_file_obj = self.transcriber.upload_file(temp_chunk_file_path)
                 if uploaded_file_obj:
-                    transcription_result_for_chunk = self.transcriber.transcribe_file(
+                    chunk_transcription_srt = self.transcriber.transcribe_file(
                         uploaded_file_obj, self.prompt
                     )
-                    if transcription_result_for_chunk:
-                        # 調整此片段轉錄結果的時間戳 (相對於整個音訊的 current_segment_start_time)
-                        adjusted_chunk_lrc = _adjust_lrc_timestamps(
-                            transcription_result_for_chunk, current_segment_start_time
+
+                    if chunk_transcription_srt and isinstance(chunk_transcription_srt, str) and chunk_transcription_srt.strip():
+                        self._log_callback("log", {"message": f"片段 {chunk_index}: 收到轉錄結果，長度 {len(chunk_transcription_srt)}。正在調整時間戳並重新編號..."})
+
+
+                        adjusted_srt_chunk, next_master_index = _adjust_srt_timestamps_and_reindex(
+                            srt_content=chunk_transcription_srt,
+                            offset_seconds=current_segment_start_time,
+                            start_index=current_srt_master_index
                         )
-                        all_transcriptions_lrc.append(adjusted_chunk_lrc)
-                        self._log_callback("log", {"message": f"片段 {chunk_index} 轉錄並調整時間戳成功。"})
+
+                        if adjusted_srt_chunk.strip(): # Only add if there's content after adjustment
+                            all_transcriptions_srt_blocks.append(adjusted_srt_chunk)
+                            current_srt_master_index = next_master_index
+                        else:
+                            self._log_callback("log", {"message": f"片段 {chunk_index}: 轉錄結果調整後為空，可能無有效字幕內容。"})
                     else:
                         self._log_callback("warn", {"message": f"片段 {chunk_index} 轉錄失敗或無內容。"})
                 else:
@@ -308,18 +324,29 @@ class TranscriptionOrchestrator:
                 current_segment_start_time = actual_segment_end_time
 
             # --- 4. 合併所有轉錄結果 ---
-            final_transcription = "\n".join(filter(None, all_transcriptions_lrc)).strip()
-            if not final_transcription:
-                self._log_callback("warn", {"message": "所有片段處理完畢，但未產生任何轉錄內容。"})
-                # return None # Or return empty string depending on desired behavior
+            final_transcription_content = ""
+            if all_transcriptions_srt_blocks:
+                final_transcription_content = "\\n\\n".join(all_transcriptions_srt_blocks).strip()
+                # Ensure a blank line at the end if there's content, some players prefer it.
+                # However, most parsers handle it fine without. For consistency, let's ensure it's clean.
+                # final_transcription_content += "\\n" 
 
-            self._log_callback("progress", {"percentage": 95, "step_message": "轉錄完成，正在整理結果..."})
-            return final_transcription
+            self._log_callback("progress", {"percentage": 95, "step_message": "轉錄完成，正在清理... "})
+            
+            if not final_transcription_content:
+                 self._log_callback("warn", {"message": "最終轉錄內容為空。"})
+                 # return None # Or return empty string as per previous logic for no content
+
+            return final_transcription_content
 
         except Exception as e:
-            self._log_callback("error", {"message": f"音訊處理流程中發生嚴重錯誤: {e}"})
-            # import traceback
-            # self._log_callback("error", {"message": f"Traceback: {traceback.format_exc()}"})
+            error_message = f"音訊處理流程中發生嚴重錯誤: {e}"
+            print(f"[ORCHESTRATOR_ERROR] {error_message}") # 直接輸出到 Celery log
+            import traceback
+            tb_str = traceback.format_exc()
+            print(f"[ORCHESTRATOR_TRACEBACK]\\n{tb_str}") # 直接輸出 traceback 到 Celery log
+            
+            self._log_callback("error", {"message": error_message, "traceback": tb_str})
             return None # Indicate overall failure
         finally:
             # --- 5. 清理 ---

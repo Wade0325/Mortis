@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -17,78 +17,151 @@ export default function AudioTranscriptionPage() {
   const [logs, setLogs] = useState<string[]>([])
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [formats, setFormats] = useState({
-    lrc: true,
+    lrc: false,
     vtt: false,
-    srt: false,
+    srt: true,
     txt: false,
   })
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const eventSourceRef = useRef<EventSource | null>(null)
+
+  const addLog = (message: string, type: "log" | "error" | "info" = "info") => {
+    const prefix = type === "error" ? "[錯誤]" : type === "log" ? "[日誌]" : "[訊息]"
+    setLogs((prevLogs) => [...prevLogs, `[${new Date().toLocaleTimeString()}] ${prefix} ${message}`])
+  }
+
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close()
+        addLog("SSE 連線已關閉 (元件卸載)", "log")
+      }
+    }
+  }, [])
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0]
       setFile(selectedFile)
+      setTranscription("")
+      setLogs([])
       addLog(`已選擇檔案: ${selectedFile.name}`)
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close()
+        addLog("先前的 SSE 連線已關閉", "log")
+      }
     }
-  }
-
-  const addLog = (message: string) => {
-    setLogs((prevLogs) => [...prevLogs, `[${new Date().toLocaleTimeString()}] ${message}`])
   }
 
   const handleStartTranscription = async () => {
     if (!file) {
-      addLog("錯誤: 請先上傳音檔")
+      addLog("請先上傳音檔", "error")
       return
     }
 
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close()
+      addLog("關閉先前的 SSE 連線...", "log")
+    }
+
+    setIsTranscribing(true)
+    setTranscription("")
+    setLogs([])
+    addLog(`開始處理檔案: ${file.name}`, "info")
+
+    const formData = new FormData()
+    formData.append("files", file)
+
     try {
-      setIsTranscribing(true)
-      addLog("開始轉錄...")
-
-      const selectedFormats = Object.entries(formats)
-        .filter(([_, isSelected]) => isSelected)
-        .map(([format]) => format)
-
-      if (selectedFormats.length === 0) {
-        addLog("錯誤: 請至少選擇一種輸出格式")
-        setIsTranscribing(false)
-        return
-      }
-
-      // 使用 FormData 準備請求數據
-      const formData = new FormData()
-      formData.append("file", file)
-      formData.append("formats", JSON.stringify(selectedFormats))
-
-      // 使用原生 fetch API 發送請求
-      const response = await fetch("/api/transcribe", {
+      const response = await fetch("http://localhost:8000/api/transcribe/start", {
         method: "POST",
         body: formData,
       })
 
       if (!response.ok) {
-        throw new Error(`伺服器回應錯誤: ${response.status}`)
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(`伺服器回應錯誤: ${response.status} ${response.statusText}. ${errorData.detail || ''}`)
       }
 
       const result = await response.json()
+      const { task_id } = result
 
-      if (!result.success) {
-        throw new Error(result.error || "轉錄失敗")
+      if (!task_id) {
+        throw new Error("未能獲取有效的 task_id")
       }
 
-      setTranscription(result.transcription)
-      addLog("轉錄完成!")
+      addLog(`成功獲取 Task ID: ${task_id}。正在建立 SSE 連線...`, "info")
+
+      const es = new EventSource(`http://localhost:8000/api/transcribe/stream/${task_id}`)
+      eventSourceRef.current = es
+      let receivedFinishEvent = false
+
+      es.onopen = () => {
+        addLog("SSE 連線已成功開啟。", "log")
+      }
+
+      es.onmessage = (event) => {
+        try {
+          const eventData = JSON.parse(event.data)
+
+          switch (eventData.type) {
+            case "log":
+            case "progress":
+              addLog(eventData.message || JSON.stringify(eventData.data) , "log")
+              break
+            case "system_log":
+                 addLog(eventData.message || eventData.data?.message, "log")
+                 break
+            case "result":
+              if (eventData.data && typeof eventData.data.transcription_text_srt === 'string') {
+                setTranscription(eventData.data.transcription_text_srt)
+                addLog("已接收到轉錄結果 (SRT)。", "info")
+              } else {
+                addLog("收到的結果 (SRT) 格式不正確或缺失。", "error")
+              }
+              break
+            case "error":
+              addLog(eventData.message || eventData.detail || "SSE 串流時發生未知錯誤", "error")
+              break
+            case "finish":
+              receivedFinishEvent = true
+              addLog("轉錄流程已完成。", "info")
+              if (es.readyState !== EventSource.CLOSED) {
+                es.close()
+                addLog("SSE 連線已關閉 (收到 finish 事件)。", "log")
+              }
+              setIsTranscribing(false)
+              break
+            default:
+              addLog(`收到未知事件類型: ${eventData.type}`, "log")
+          }
+        } catch (e) {
+          addLog(`處理 SSE 事件時發生錯誤: ${e instanceof Error ? e.message : String(e)}`, "error")
+        }
+      }
+
+      es.onerror = (err) => {
+        if (receivedFinishEvent) {
+          addLog("SSE 連線已由伺服器正常關閉。", "log")
+        } else {
+          addLog("SSE 連線發生錯誤。", "error")
+        }
+        if (es.readyState !== EventSource.CLOSED) {
+          es.close()
+        }
+        setIsTranscribing(false)
+        eventSourceRef.current = null
+      }
+
     } catch (error) {
-      addLog(`轉錄過程中發生錯誤: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
+      addLog(`啟動轉錄失敗: ${error instanceof Error ? error.message : String(error)}`, "error")
       setIsTranscribing(false)
     }
   }
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!transcription) {
-      addLog("錯誤: 沒有可儲存的轉錄結果")
+      addLog("錯誤: 沒有可儲存的轉錄結果", "error")
       return
     }
 
@@ -96,18 +169,67 @@ export default function AudioTranscriptionPage() {
       .filter(([_, isSelected]) => isSelected)
       .map(([format]) => format)
 
-    selectedFormats.forEach((format) => {
-      const blob = new Blob([transcription], { type: "text/plain" })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `transcription.${format}`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      addLog(`已儲存 ${format.toUpperCase()} 格式檔案`)
-    })
+    if (selectedFormats.length === 0) {
+      addLog("請至少選擇一種輸出格式進行儲存", "error")
+      return
+    }
+
+    const baseFilename = file?.name ? file.name.substring(0, file.name.lastIndexOf('.')) || file.name : "transcription";
+
+    for (const format of selectedFormats) {
+      let blob;
+      let downloadFilename = `${baseFilename}.${format.toLowerCase()}`;
+
+      addLog(`正在從伺服器準備 ${format.toUpperCase()} 檔案...`, "info")
+      try {
+        const response = await fetch("http://localhost:8000/api/transcribe/download", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            transcription_text_srt: transcription,
+            format: format.toLowerCase(),
+            original_filename: file?.name || `${baseFilename}_audio`
+          }),
+        });
+
+        if (!response.ok) {
+          const errorResult = await response.json().catch(() => ({}));
+          throw new Error(`伺服器錯誤 ${response.status}: ${errorResult.detail || response.statusText}`);
+        }
+
+        blob = await response.blob();
+        const disposition = response.headers.get('content-disposition');
+        if (disposition) {
+          const filenameMatch = disposition.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+          if (filenameMatch && filenameMatch[1]) {
+            downloadFilename = decodeURIComponent(filenameMatch[1].replace(/["']/g, ''));
+          } else {
+            const simpleFilenameMatch = disposition.match(/filename="?([^"\n;]+)"?/i);
+            if (simpleFilenameMatch && simpleFilenameMatch[1]) {
+              downloadFilename = simpleFilenameMatch[1];
+            }
+          }
+        }
+        addLog(`${format.toUpperCase()} 檔案已準備好下載。`, "info")
+      } catch (error) {
+        addLog(`準備 ${format.toUpperCase()} 檔案失敗: ${error instanceof Error ? error.message : String(error)}`, "error");
+        continue;
+      }
+      
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = downloadFilename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        addLog(`已觸發 ${downloadFilename} 檔案的儲存。`, "info");
+      }
+    }
   }
 
   return (

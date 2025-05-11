@@ -19,7 +19,8 @@ def _load_or_create_config() -> Dict[str, Any]:
     default_structure = {
         "api_key": {API_KEY_FIELDS["Google"]: ""},
         AVAILABLE_MODELS_FIELD: {"Google": DEFAULT_GOOGLE_AVAILABLE_MODELS},
-        PROMPT_FIELD: "以下是會議記錄：", # 預設提示詞
+        PROMPT_FIELD: 
+        "請將音訊檔案轉錄成日文，使用 SRT (SubRip Text) 字幕格式回覆我，只要給我SRT格式以及轉錄內容，不要給我其他文字",
         SELECTED_MODELS_FIELD: {"Google": DEFAULT_GOOGLE_AVAILABLE_MODELS[0] if DEFAULT_GOOGLE_AVAILABLE_MODELS else None}
     }
     if not os.path.exists(CONFIG_FILE_PATH):

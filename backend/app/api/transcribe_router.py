@@ -39,9 +39,9 @@ class TranscriptionStartResponse(BaseModel):
     # celery_task_id: str # Optionally return Celery's internal task ID for backend debugging
 
 class DownloadRequest(BaseModel):
-    transcription_text_lrc: str
-    format: str # "lrc", "srt", "vtt"
-    original_filename: str
+    transcription_text_srt: str # Changed from transcription_text_lrc
+    format: str # "lrc", "srt", "vtt", "txt"
+    original_filename: Optional[str] = None # Made optional, filename can be generated if not provided
 
 
 # --- API Endpoints ---
@@ -103,7 +103,7 @@ async def sse_event_generator(task_id: str, request: Request, redis_client: Any)
 
                         if event_type == "finish" or event_type == "error": # Stop streaming after these final events
                             print(f"SSE stream for task {task_id} ending due to '{event_type}' event.")
-                            break
+                            
                     except json.JSONDecodeError:
                         # If data is not valid JSON, send it as a raw message or log an error
                         yield f"event: raw_message\ndata: {json.dumps({'content': data_str})}\n\n"
@@ -150,23 +150,31 @@ async def stream_task_events_route(
 
 @router.post("/download")
 async def download_transcription_file_route(payload: DownloadRequest):
-    if not payload.transcription_text_lrc:
-        raise HTTPException(status_code=400, detail="No transcription text provided.")
+    if not payload.transcription_text_srt:
+        raise HTTPException(status_code=400, detail="No transcription text (SRT) provided.")
 
     output_text = ""
-    file_extension = ".txt" # Default if format is unknown or lrc
+    file_extension = ".txt" # Default extension
+    media_type = "text/plain"
 
-    if payload.format == "lrc":
-        output_text = payload.transcription_text_lrc
-        file_extension = ".lrc"
-    elif payload.format == "srt":
-        output_text = format_converter_service.convert_lrc_to_srt_content(payload.transcription_text_lrc)
+    if payload.format == "srt":
+        output_text = payload.transcription_text_srt
         file_extension = ".srt"
+        media_type = "application/x-subrip" # More specific media type for SRT
+    elif payload.format == "lrc":
+        output_text = format_converter_service.convert_srt_to_lrc(payload.transcription_text_srt)
+        file_extension = ".lrc"
+        media_type = "text/plain" # No standard MIME for LRC, text/plain is common
     elif payload.format == "vtt":
-        output_text = format_converter_service.convert_lrc_to_vtt_content(payload.transcription_text_lrc)
+        output_text = format_converter_service.convert_srt_to_vtt(payload.transcription_text_srt)
         file_extension = ".vtt"
+        media_type = "text/vtt"
+    elif payload.format == "txt":
+        output_text = format_converter_service.convert_srt_to_txt(payload.transcription_text_srt)
+        file_extension = ".txt"
+        media_type = "text/plain"
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported format: {payload.format}. Supported: lrc, srt, vtt.")
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {payload.format}. Supported: srt, lrc, vtt, txt.")
 
     # Create filename
     base_name = os.path.splitext(payload.original_filename)[0] if payload.original_filename else "transcription"
@@ -183,7 +191,7 @@ async def download_transcription_file_route(payload: DownloadRequest):
         return FileResponse(
             path=temp_file_path,
             filename=download_filename,
-            media_type='text/plain', # Or more specific like 'text/srt' if known
+            media_type=media_type,
             background=tempfile.NamedTemporaryFile(tmp_file.name) # Ensures cleanup after response
         )
     except Exception as e:

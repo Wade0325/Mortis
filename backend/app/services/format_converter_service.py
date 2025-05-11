@@ -1,65 +1,148 @@
 # backend/app/services/format_converter_service.py
 import re
-from typing import Optional
+from typing import Optional, List, Tuple
 
-def _parse_lrc_time_for_subtitle(time_str: str) -> Optional[float]:
-    """將 [mm:ss.xx] 或 [mm:ss.xxx] 格式轉換為總秒數"""
-    match = re.match(r'\[(\d{2}):(\d{2})\.(\d{2,3})\]', time_str)
+# --- SRT/VTT Time Parsing and Formatting --- #
+
+def _parse_srt_timestamp_to_seconds(time_str: str) -> Optional[float]:
+    """Converts HH:MM:SS,mmm string to total seconds."""
+    match = re.match(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', time_str)
     if match:
-        m, s, cs_or_ms = map(int, match.groups())
-        millis = cs_or_ms * 10 if len(match.group(3)) == 2 else cs_or_ms
-        return m * 60 + s + millis / 1000.0
+        h, m, s, ms = map(int, match.groups())
+        return h * 3600 + m * 60 + s + ms / 1000.0
     return None
 
-def _format_timestamp_for_subtitle(seconds: float, format_type: str = 'srt') -> str:
-    """將總秒數格式化為 HH:MM:SS,sss (srt) 或 HH:MM:SS.sss (vtt)"""
+def _format_seconds_to_srt_vtt_timestamp(seconds: float, format_type: str = 'srt') -> str:
+    """Formats total seconds to HH:MM:SS,sss (srt) or HH:MM:SS.sss (vtt)."""
     if seconds < 0: seconds = 0
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    millisecs = int(round((seconds - int(seconds)) * 1000)) # round to handle precision
-    # Ensure millisecs doesn't exceed 999 due to rounding
-    if millisecs > 999 : millisecs = 999
+    millis = int(round((seconds - int(seconds)) * 1000))
+    
+    if millis >= 1000: # Handle rounding that pushes millis to 1000 or more
+        millis = 0
+        secs += 1
+        if secs >= 60:
+            secs = 0
+            minutes += 1
+            if minutes >= 60:
+                minutes = 0
+                hours += 1
+    
+    separator = ',' if format_type == 'srt' else '.'
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{separator}{millis:03d}"
 
-    sep = ',' if format_type == 'srt' else '.'
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{millisecs:03d}"
+def _format_seconds_to_lrc_timestamp(seconds: float) -> str:
+    """Formats total seconds to [mm:ss.xx] for LRC."""
+    if seconds < 0: seconds = 0
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    # For LRC, it's common to use centiseconds (2 digits)
+    centis = int(round((seconds - int(seconds)) * 100))
+    if centis >= 100: # Handle rounding for centiseconds
+        centis = 0
+        secs += 1
+        if secs >= 60:
+            secs = 0
+            minutes += 1
+    return f"[{minutes:02d}:{secs:02d}.{centis:02d}]"
 
-def convert_lrc_to_srt_content(lrc_text: str, line_duration: int = 3) -> str:
-    """將 LRC 文本轉換為 SRT 格式 (使用固定時長)"""
-    lines = lrc_text.strip().split('\n')
-    srt_output = []
-    counter = 1
-    for line in lines:
-        time_match = re.match(r'(\[\d{2}:\d{2}\.\d{2,3}\])(.*)', line)
-        if time_match:
-            time_tag, text = time_match.groups()
-            start_time_sec = _parse_lrc_time_for_subtitle(time_tag)
-            if start_time_sec is not None:
-                end_time_sec = start_time_sec + line_duration
-                start_str = _format_timestamp_for_subtitle(start_time_sec, 'srt')
-                end_str = _format_timestamp_for_subtitle(end_time_sec, 'srt')
-                srt_output.append(str(counter))
-                srt_output.append(f"{start_str} --> {end_str}")
-                srt_output.append(text.strip())
-                srt_output.append("")  # 空行分隔
-                counter += 1
-    return "\n".join(srt_output)
+# --- SRT Parsing Helper --- #
+class SRTEntry(Tuple[int, float, float, List[str]]):
+    index: int
+    start_time_sec: float
+    end_time_sec: float
+    text_lines: List[str]
 
-def convert_lrc_to_vtt_content(lrc_text: str, line_duration: int = 3) -> str:
-    """將 LRC 文本轉換為 VTT 格式 (使用固定時長)"""
-    lines = lrc_text.strip().split('\n')
+def _parse_srt_content(srt_text: str) -> List[SRTEntry]:
+    """Parses an SRT string into a list of SRTEntry objects."""
+    if not srt_text.strip():
+        return []
+    
+    entries: List[SRTEntry] = []
+    srt_blocks_raw = re.split(r'\\n\\s*\\n', srt_text.strip())
+    srt_blocks = [block.strip() for block in srt_blocks_raw if block.strip()]
+
+    for block_str in srt_blocks:
+        lines = block_str.split('\\n')
+        if len(lines) < 3: # Index, Time, Text (at least one line)
+            continue
+        
+        try:
+            index = int(lines[0])
+        except ValueError:
+            continue # Invalid index
+            
+        time_line_match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})', lines[1])
+        if not time_line_match:
+            continue # Invalid time line
+            
+        start_time_str, end_time_str = time_line_match.groups()
+        start_time_sec = _parse_srt_timestamp_to_seconds(start_time_str)
+        end_time_sec = _parse_srt_timestamp_to_seconds(end_time_str)
+        
+        if start_time_sec is None or end_time_sec is None or end_time_sec < start_time_sec:
+            continue # Invalid times
+            
+        text_lines = lines[2:]
+        if not any(line.strip() for line in text_lines): # Skip if text is empty or only whitespace
+            continue
+
+        entries.append(SRTEntry((index, start_time_sec, end_time_sec, text_lines)))
+    return entries
+
+# --- Conversion Functions --- #
+
+def convert_srt_to_lrc(srt_text: str) -> str:
+    """Converts SRT formatted text to LRC format."""
+    srt_entries = _parse_srt_content(srt_text)
+    if not srt_entries:
+        return ""
+    
+    lrc_lines = []
+    for entry in srt_entries:
+        # LRC typically uses the start time of the line.
+        # And text is usually single line in LRC from multi-line SRT, join with space.
+        lrc_time_tag = _format_seconds_to_lrc_timestamp(entry[1]) # entry[1] is start_time_sec
+        text_content = " ".join(line.strip() for line in entry[3]) # entry[3] is text_lines
+        lrc_lines.append(f"{lrc_time_tag}{text_content}")
+        
+    return "\n".join(lrc_lines)
+
+def convert_srt_to_vtt(srt_text: str) -> str:
+    """Converts SRT formatted text to VTT format."""
+    srt_entries = _parse_srt_content(srt_text)
+    
     vtt_output = ["WEBVTT", ""]
-    for line in lines:
-        time_match = re.match(r'(\[\d{2}:\d{2}\.\d{2,3}\])(.*)', line)
-        if time_match:
-            time_tag, text = time_match.groups()
-            start_time_sec = _parse_lrc_time_for_subtitle(time_tag)
-            if start_time_sec is not None:
-                end_time_sec = start_time_sec + line_duration
-                start_str = _format_timestamp_for_subtitle(start_time_sec, 'vtt')
-                end_str = _format_timestamp_for_subtitle(end_time_sec, 'vtt')
-                # VTT doesn't use sequence numbers in the same way as SRT for simple cases
-                vtt_output.append(f"{start_str} --> {end_str}")
-                vtt_output.append(text.strip())
-                vtt_output.append("")  # 空行分隔
+    if not srt_entries:
+        return "WEBVTT\n"
+
+    for entry in srt_entries:
+        start_time_vtt = _format_seconds_to_srt_vtt_timestamp(entry[1], 'vtt') # entry[1] is start_time_sec
+        end_time_vtt = _format_seconds_to_srt_vtt_timestamp(entry[2], 'vtt')   # entry[2] is end_time_sec
+        
+        vtt_output.append(f"{start_time_vtt} --> {end_time_vtt}")
+        for text_line in entry[3]: # entry[3] is text_lines
+            vtt_output.append(text_line.strip())
+        vtt_output.append("") # Blank line after each cue
+        
     return "\n".join(vtt_output)
+
+# --- Functions to keep if direct TXT output from SRT is desired --- #
+def convert_srt_to_txt(srt_text: str) -> str:
+    """Converts SRT to plain text, stripping timestamps and indices."""
+    srt_entries = _parse_srt_content(srt_text)
+    if not srt_entries:
+        return ""
+    
+    text_only_lines = []
+    for entry in srt_entries:
+        for text_line in entry[3]: # entry[3] is text_lines
+            text_only_lines.append(text_line.strip())
+            
+    return "\n".join(text_only_lines)
+
+
+# Old LRC parsing functions are removed as they are no longer primary.
+# If needed for some other utility, they can be added back or placed elsewhere.

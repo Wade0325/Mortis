@@ -63,18 +63,18 @@ def run_transcription_pipeline(self, task_id: str, file_paths: List[str], settin
         primary_audio_path = file_paths[0] # Take the first file
         original_filename = os.path.basename(primary_audio_path)
 
-        final_lrc_content = orchestrator.process_audio(primary_audio_path)
+        final_srt_content = orchestrator.process_audio(primary_audio_path)
 
-        if final_lrc_content is not None:
+        if final_srt_content is not None:
             _publish_event_to_redis(task_id, {
                 "type": "result",
                 "data": {
-                    "transcription_text_lrc": final_lrc_content,
+                    "transcription_text_srt": final_srt_content,
                     "original_filename": original_filename
                 }
             })
             # Celery task result (can be retrieved via Celery backend if needed)
-            return {"status": "SUCCESS", "task_id": task_id, "lrc_length": len(final_lrc_content)}
+            return {"status": "SUCCESS", "task_id": task_id, "lrc_length": len(final_srt_content)}
         else:
             orchestrator_log_callback("error", {"message": "Transcription pipeline did not return content."})
             # Celery task result for failure

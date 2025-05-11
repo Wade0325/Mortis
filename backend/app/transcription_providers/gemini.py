@@ -4,23 +4,49 @@ import os
 import time
 from .base import Transcriber, LogCallbackType
 from typing import Optional
+import sys
+
 class GeminiTranscriber(Transcriber):
     def __init__(self, api_key: str, model_name: str, log_callback: LogCallbackType = None):
         super().__init__(api_key, model_name, log_callback)
+        self.log_callback = log_callback # Explicitly set it on the instance for clarity/safety
         self.model: Optional[genai.GenerativeModel] = None
         try:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel(self.model_name) # Uses model_name directly
             self._log("log", {"message": f"Gemini API 配置成功，使用模型: {self.model_name}"})
+            self.uploaded_files_info = {} # Store uploaded file info {gemini_file_name: genai.File}
         except Exception as e:
             self._log("error", {"message": f"Gemini 初始化失敗: {e}"})
             raise # Re-raise exception to be caught by orchestrator
+
+    def _log(self, event_type: str, data: dict):
+        # Ensure data is a dict, as expected by the callback
+        if not isinstance(data, dict):
+            print(f"[GEMINI_TRANSCRIBER_LOG_WARNING] _log called with non-dict data: {data}")
+            log_data = {"message": str(data)}
+        else:
+            log_data = data
+
+        # If it's an error, also print directly to Celery worker logs for easier debugging
+        if event_type == "error":
+            print(f"[GEMINI_TRANSCRIBER_ERROR] {log_data}")
+
+        if self.log_callback:
+            try:
+                self.log_callback(event_type, log_data)
+            except Exception as e_cb:
+                # Log callback failure to stderr (Celery worker log)
+                print(f"[GEMINI_TRANSCRIBER_LOG_CALLBACK_ERROR] Failed to send log via callback: {e_cb} | Original log: {event_type} - {log_data}", file=sys.stderr)
+
     def upload_file(self, file_path: str) -> Optional[genai.types.File]:
         filename = os.path.basename(file_path)
+        print(f"upload_file: {filename}")
         self._log("log", {"message": f"開始上傳檔案到 Gemini: {filename}..."})
         try:
             # display_name helps identify the file in the Gemini console
             uploaded_file = genai.upload_file(path=file_path, display_name=filename)
+            print(f"uploaded_file: {uploaded_file}")
             self._log("log", {"message": f"Gemini 檔案 '{filename}' 上傳中，等待處理... (ID: {uploaded_file.name})"})
             # Polling for ACTIVE state
             polling_interval = 5 # seconds
@@ -30,6 +56,7 @@ class GeminiTranscriber(Transcriber):
                 time.sleep(polling_interval)
                 elapsed_time += polling_interval
                 uploaded_file = genai.get_file(name=uploaded_file.name)
+                print(f"uploaded_file: {uploaded_file}")
                 self._log("log", {"message": f"Gemini 檔案 '{filename}' 狀態: {uploaded_file.state.name} (已等待 {elapsed_time}s)"})
             if uploaded_file.state.name != "ACTIVE":
                 self._log("error", {

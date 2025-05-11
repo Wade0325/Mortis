@@ -11,3 +11,4 @@ torchaudio==2.7.0
 silero-vad==5.1.2
 python-multipart
 gevent==25.4.2
+soundfile==0.12.1
