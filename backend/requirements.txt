@@ -1,0 +1,13 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2 # For running the FastAPI app
+pydantic==2.11.4
+pydantic-settings
+celery==5.5.2
+redis==6.0.0 # Python client for Redis (used by Celery and for Pub/Sub)
+python-dotenv==1.1.0 # For managing environment variables
+google-generativeai==0.8.5 # From original project
+torch==2.7.0
+torchaudio==2.7.0
+silero-vad==5.1.2
+python-multipart
+gevent==25.4.2
